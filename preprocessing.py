@@ -30,3 +30,7 @@ def apply_attenuation_light(img, x0, y0, kc=1.0, kl=0.01, kq=0.01):
     return img * attenuation[:, :, np.newaxis]
 
 
+def make_one_patch(light, power_of_light ,reflect, sensor):
+    response = 10 * power_of_light * k * (sensor.T @ (reflect.values * light)).T
+    patch = np.broadcast_to(response, (32, 32, 3))
+    return patch
