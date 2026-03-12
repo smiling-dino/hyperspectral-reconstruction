@@ -104,6 +104,7 @@ class SpectrumDataset(Dataset):
 
 train_dataset = SpectrumDataset(train_reflect)
 val_dataset = SpectrumDataset(val_reflect)
+test_dataset = SpectrumDataset(test_reflect)
 
 # 512 спектров за одну итерацию
 palettes_in_batch = 16
@@ -119,6 +120,14 @@ train_loader = DataLoader(
 
 val_loader = DataLoader(
     val_dataset,
+    batch_size=16,
+    shuffle=False,
+    drop_last=False,
+    num_workers=4
+)
+
+test_loader = DataLoader(
+    test_dataset,
     batch_size=16,
     shuffle=False,
     drop_last=False,
@@ -256,10 +265,6 @@ class HSILoss(nn.Module):
         return self.alpha * nse_loss + (1.0 - self.alpha) * sam_loss
 
 device = torch.device('cuda:1')
-model = MSTpp(in_channels=3, out_channels=31).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-criterion = HSILoss(alpha=0.5).to(device)
-
 # metric_deltaE = DeltaE().to(device)
 
 sensor_gpu = torch.tensor(sensor.values, dtype=torch.float32, device=device)
@@ -359,53 +364,79 @@ def val_step(model, dataloader, criterion, device, flash=True):
 
     return metrics
 
+names_of_experiments = ["mstpp_v1",
+                        "mstpp_v1_with_flash",
+                        "hscnn_v1",
+                        "hscnn_v1_with_flash"]
 
-import os
-from torch.utils.tensorboard import SummaryWriter
+models = [MSTpp(in_channels=3, out_channels=31),
+          MSTpp(in_channels=6, out_channels=31),
+          HSCNNp(in_channels=3, out_channels=31),
+          HSCNNp(in_channels=6, out_channels=31)]
 
-name_of_experiment = "mstpp_v1"
+models_dict = {}
+for name in names_of_experiments:
+    is_flash = "flash" in name
+    in_channels = 6 if is_flash else 3
 
-log_dir = f"runs/{name_of_experiment}"
-writer = SummaryWriter(log_dir=log_dir)
+    if "mstpp" in name:
+        model = MSTpp(in_channels=in_channels, out_channels=31).to(device)
+    else:
+        model = HSCNNp(in_channels=in_channels, out_channels=31).to(device)
 
-EPOCHS = 1000
-best_sam = float('inf')
+    weights_path = f"./checkpoints/{name}/best_model.pth"
+    model.load_state_dict(torch.load(weights_path, map_location=device))
+    model.eval()
 
-os.makedirs(f"checkpoints/{name_of_experiment}", exist_ok=True)
+    models_dict[name] = {"model": model, "is_flash": is_flash}
 
-for epoch in range(EPOCHS):
-    print(f"\n--- Epoch {epoch + 1}/{EPOCHS} ---")
+num_models = len(names_of_experiments)
 
-    train_loss = train_step(model, train_loader, renderer, optimizer, criterion, device, flash=False)
+for batch_idx, spectra in enumerate(test_loader):
+    spectra = spectra.to(device)
+    spectra_palettes = spectra.view(1, 16, 31)
 
-    writer.add_scalar('Loss/Train', train_loss, epoch)
+    fig, axes = plt.subplots(num_models, 3, figsize=(15, 4 * num_models))
+    fig.suptitle(f"Error Maps for Test Patch #{batch_idx + 1}", fontsize=16)
 
-    val_metrics = val_step(model, val_loader, criterion, device, flash=False)
+    for idx, (name, config) in enumerate(models_dict.items()):
+        model = config["model"]
+        is_flash = config["is_flash"]
 
-    writer.add_scalar('Loss/Validation', val_metrics['Loss'], epoch)
-    writer.add_scalar('Metrics/SAM_deg', val_metrics['SAM_deg'], epoch)
-    writer.add_scalar('Metrics/NSE', val_metrics['NSE'], epoch)
-    if 'DeltaE' in val_metrics:
-        writer.add_scalar('Metrics/DeltaE', val_metrics['DeltaE'], epoch)
+        torch.manual_seed(42 + batch_idx)
 
-    print(f"Train Loss: {train_loss:.4f}")
-    print(f"Val Loss:   {val_metrics['Loss']:.4f}")
-    print(f"Val SAM:    {val_metrics['SAM_deg']:.4f} (lower is better)")
-    print(f"Val NSE:    {val_metrics['NSE']:.4f} (lower is better)")
+        if is_flash:
+            X_batch, y_target = renderer.render_batch(spectra_palettes)
+            input_rgb = X_batch[0, :3].permute(1, 2, 0).cpu().numpy()
+        else:
+            X_batch, y_target = renderer.render_no_flash_batch(spectra_palettes)
+            input_rgb = X_batch[0, :3].permute(1, 2, 0).cpu().numpy()
 
-    if (epoch + 1) % 20 == 0:
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }
-        checkpoint_path = f"checkpoints/{name_of_experiment}/checkpoint_epoch_{epoch + 1}.pth"
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Saved checkpoint: {checkpoint_path}")
+        with torch.no_grad():
+            preds = model(X_batch)
 
-    if val_metrics['SAM_deg'] < best_sam:
-        best_sam = val_metrics['SAM_deg']
-        torch.save(model.state_dict(), f"checkpoints/{name_of_experiment}/best_model.pth")
-        print(f"New best model saved with SAM: {best_sam:.4f}")
+        nse_map = pixelwise_normalized_spectral_error(preds, y_target)[0].cpu().numpy()
+        sam_map = pixelwise_spectral_angle_mapper(preds, y_target)[0].cpu().numpy()
 
-writer.close()
+        ax_rgb = axes[idx, 0]
+        ax_nse = axes[idx, 1]
+        ax_sam = axes[idx, 2]
+
+        ax_rgb.imshow(input_rgb)
+        ax_rgb.set_title(f"Input RGB ({name})")
+        ax_rgb.axis('off')
+
+        im_nse = ax_nse.imshow(nse_map, cmap='magma', vmin=0.0, vmax=1.0)
+        ax_nse.set_title(f"NSE Error Map ({name})")
+        ax_nse.axis('off')
+        fig.colorbar(im_nse, ax=ax_nse, fraction=0.046, pad=0.04)
+
+        im_sam = ax_sam.imshow(sam_map, cmap='magma', vmin=1.5, vmax=8.0)
+        ax_sam.set_title(f"SAM Error Map [deg] ({name})")
+        ax_sam.axis('off')
+        fig.colorbar(im_sam, ax=ax_sam, fraction=0.046, pad=0.04)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+    # break

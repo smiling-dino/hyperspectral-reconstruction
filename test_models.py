@@ -104,6 +104,7 @@ class SpectrumDataset(Dataset):
 
 train_dataset = SpectrumDataset(train_reflect)
 val_dataset = SpectrumDataset(val_reflect)
+test_dataset = SpectrumDataset(test_reflect)
 
 # 512 спектров за одну итерацию
 palettes_in_batch = 16
@@ -119,6 +120,14 @@ train_loader = DataLoader(
 
 val_loader = DataLoader(
     val_dataset,
+    batch_size=16,
+    shuffle=False,
+    drop_last=False,
+    num_workers=4
+)
+
+test_loader = DataLoader(
+    test_dataset,
     batch_size=16,
     shuffle=False,
     drop_last=False,
@@ -256,10 +265,6 @@ class HSILoss(nn.Module):
         return self.alpha * nse_loss + (1.0 - self.alpha) * sam_loss
 
 device = torch.device('cuda:1')
-model = MSTpp(in_channels=3, out_channels=31).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-criterion = HSILoss(alpha=0.5).to(device)
-
 # metric_deltaE = DeltaE().to(device)
 
 sensor_gpu = torch.tensor(sensor.values, dtype=torch.float32, device=device)
@@ -359,53 +364,23 @@ def val_step(model, dataloader, criterion, device, flash=True):
 
     return metrics
 
+names_of_experiments = ["mstpp_v1","mstpp_v1_with_flash", "hscnn_v1", "hscnn_v1_with_flash"]
+models = [MSTpp(in_channels=3, out_channels=31),
+          MSTpp(in_channels=6, out_channels=31),
+          HSCNNp(in_channels=3, out_channels=31),
+          HSCNNp(in_channels=6, out_channels=31)]
 
-import os
-from torch.utils.tensorboard import SummaryWriter
+for i, name in enumerate(names_of_experiments):
+    criterion = HSILoss(alpha=0.5).to(device)
+    weights_path = f"checkpoints/{name}/best_model.pth"
+    model = models[i].to(device)
+    model.load_state_dict(torch.load(weights_path))
+    if i % 2 == 0:
+        val_metrics = val_step(model, test_loader, criterion, device, flash=False)
+    else:
+        val_metrics = val_step(model, test_loader, criterion, device, flash=True)
 
-name_of_experiment = "mstpp_v1"
-
-log_dir = f"runs/{name_of_experiment}"
-writer = SummaryWriter(log_dir=log_dir)
-
-EPOCHS = 1000
-best_sam = float('inf')
-
-os.makedirs(f"checkpoints/{name_of_experiment}", exist_ok=True)
-
-for epoch in range(EPOCHS):
-    print(f"\n--- Epoch {epoch + 1}/{EPOCHS} ---")
-
-    train_loss = train_step(model, train_loader, renderer, optimizer, criterion, device, flash=False)
-
-    writer.add_scalar('Loss/Train', train_loss, epoch)
-
-    val_metrics = val_step(model, val_loader, criterion, device, flash=False)
-
-    writer.add_scalar('Loss/Validation', val_metrics['Loss'], epoch)
-    writer.add_scalar('Metrics/SAM_deg', val_metrics['SAM_deg'], epoch)
-    writer.add_scalar('Metrics/NSE', val_metrics['NSE'], epoch)
-    if 'DeltaE' in val_metrics:
-        writer.add_scalar('Metrics/DeltaE', val_metrics['DeltaE'], epoch)
-
-    print(f"Train Loss: {train_loss:.4f}")
-    print(f"Val Loss:   {val_metrics['Loss']:.4f}")
-    print(f"Val SAM:    {val_metrics['SAM_deg']:.4f} (lower is better)")
-    print(f"Val NSE:    {val_metrics['NSE']:.4f} (lower is better)")
-
-    if (epoch + 1) % 20 == 0:
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }
-        checkpoint_path = f"checkpoints/{name_of_experiment}/checkpoint_epoch_{epoch + 1}.pth"
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Saved checkpoint: {checkpoint_path}")
-
-    if val_metrics['SAM_deg'] < best_sam:
-        best_sam = val_metrics['SAM_deg']
-        torch.save(model.state_dict(), f"checkpoints/{name_of_experiment}/best_model.pth")
-        print(f"New best model saved with SAM: {best_sam:.4f}")
-
-writer.close()
+    print(name)
+    print(f"Test Loss: {val_metrics['Loss']:.4f}")
+    print(f"Test SAM:  {val_metrics['SAM_deg']:.4f}")
+    print(f"Test NSE:  {val_metrics['NSE']:.4f}")
