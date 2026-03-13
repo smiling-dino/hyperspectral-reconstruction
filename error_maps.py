@@ -238,9 +238,6 @@ class PaletteRenderer:
 
         return X_amb_img, y_hsi
 
-import torch
-import torch.nn as nn
-
 def pixelwise_spectral_angle_mapper(preds: Tensor, target: Tensor, eps=1e-8):
     products = (preds * target).sum(dim=-3)
     magnitudes = preds.norm(dim=-3) * target.norm(dim=-3) + eps
@@ -391,52 +388,293 @@ for name in names_of_experiments:
     models_dict[name] = {"model": model, "is_flash": is_flash}
 
 num_models = len(names_of_experiments)
+sns.set_theme('paper')
+def show_error_maps():
+    for batch_idx, spectra in enumerate(test_loader):
+        spectra = spectra.to(device)
+        spectra_palettes = spectra.view(1, 16, 31)
 
-for batch_idx, spectra in enumerate(test_loader):
-    spectra = spectra.to(device)
-    spectra_palettes = spectra.view(1, 16, 31)
+        fig, axes = plt.subplots(num_models, 3, figsize=(8, 2.5 * num_models))
+        fig.suptitle(f"Error Maps for Test Patch #{batch_idx + 1}", fontsize=16)
 
-    fig, axes = plt.subplots(num_models, 3, figsize=(15, 4 * num_models))
-    fig.suptitle(f"Error Maps for Test Patch #{batch_idx + 1}", fontsize=16)
+        for idx, (name, config) in enumerate(models_dict.items()):
+            model = config["model"]
+            is_flash = config["is_flash"]
 
-    for idx, (name, config) in enumerate(models_dict.items()):
-        model = config["model"]
-        is_flash = config["is_flash"]
+            torch.manual_seed(42 + batch_idx)
 
-        torch.manual_seed(42 + batch_idx)
+            if is_flash:
+                X_batch, y_target = renderer.render_batch(spectra_palettes)
+                input_rgb = X_batch[0, :3].permute(1, 2, 0).cpu().numpy()
+            else:
+                X_batch, y_target = renderer.render_no_flash_batch(spectra_palettes)
+                input_rgb = X_batch[0, :3].permute(1, 2, 0).cpu().numpy()
 
-        if is_flash:
-            X_batch, y_target = renderer.render_batch(spectra_palettes)
+            with torch.no_grad():
+                preds = model(X_batch)
+
+            nse_map = pixelwise_normalized_spectral_error(preds, y_target)[0].cpu().numpy()
+            sam_map = pixelwise_spectral_angle_mapper(preds, y_target)[0].cpu().numpy()
+
+            ax_rgb = axes[idx, 0]
+            ax_nse = axes[idx, 1]
+            ax_sam = axes[idx, 2]
+
+            ax_rgb.imshow(input_rgb)
+            ax_rgb.set_title(f"RGB ({name})")
+            ax_rgb.axis('off')
+
+            im_nse = ax_nse.imshow(nse_map, cmap='magma', vmin=0.0, vmax=1.0)
+            ax_nse.set_title(f"NSE ({name})")
+            ax_nse.axis('off')
+            fig.colorbar(im_nse, ax=ax_nse, fraction=0.046, pad=0.04)
+
+            im_sam = ax_sam.imshow(sam_map, cmap='magma', vmin=1.5, vmax=8.0)
+            ax_sam.set_title(f"SAM [deg] ({name})")
+            ax_sam.axis('off')
+            fig.colorbar(im_sam, ax=ax_sam, fraction=0.046, pad=0.04)
+
+        # plt.tight_layout(h_pad=0.5, w_pad=0.5, rect=[0, 0.03, 1, 0.95])
+        plt.show()
+        # break
+
+
+def show_error_maps_v2():
+    for batch_idx, spectra in enumerate(test_loader):
+        spectra = spectra.to(device)
+        spectra_palettes = spectra.view(1, 16, 31)
+
+        fig, axes = plt.subplots(2, 5, figsize=(18, 7))
+        fig.suptitle(f"Error Maps for Test Patch #{batch_idx + 1}", fontsize=16)
+
+        for row_idx, is_flash in enumerate([False, True]):
+            torch.manual_seed(42 + batch_idx)
+
+            if is_flash:
+                X_batch, y_target = renderer.render_batch(spectra_palettes)
+                row_label = "Flash"
+            else:
+                X_batch, y_target = renderer.render_no_flash_batch(spectra_palettes)
+                row_label = "No Flash"
+
             input_rgb = X_batch[0, :3].permute(1, 2, 0).cpu().numpy()
-        else:
-            X_batch, y_target = renderer.render_no_flash_batch(spectra_palettes)
+
+            ax_rgb = axes[row_idx, 0]
+            ax_rgb.imshow(input_rgb)
+            ax_rgb.set_title(f"Input RGB ({row_label})")
+            ax_rgb.axis('off')
+
+            hscnn_name, hscnn_model = None, None
+            mstpp_name, mstpp_model = None, None
+
+            for name, config in models_dict.items():
+                if config["is_flash"] == is_flash:
+                    if "mstpp" in name:
+                        mstpp_name, mstpp_model = name, config["model"]
+                    else:
+                        hscnn_name, hscnn_model = name, config["model"]
+
+            if hscnn_model is not None:
+                with torch.no_grad():
+                    preds_hscnn = hscnn_model(X_batch)
+
+                nse_hscnn = pixelwise_normalized_spectral_error(preds_hscnn, y_target)[0].cpu().numpy()
+                sam_hscnn = pixelwise_spectral_angle_mapper(preds_hscnn, y_target)[0].cpu().numpy()
+
+                ax_nse_h = axes[row_idx, 1]
+                im_nse_h = ax_nse_h.imshow(nse_hscnn, cmap='magma', vmin=0.0, vmax=1.0)
+                ax_nse_h.set_title(f"NSE ({hscnn_name})")
+                ax_nse_h.axis('off')
+                fig.colorbar(im_nse_h, ax=ax_nse_h, fraction=0.046, pad=0.04, shrink=0.8)
+
+                ax_sam_h = axes[row_idx, 2]
+                im_sam_h = ax_sam_h.imshow(sam_hscnn, cmap='magma', vmin=1.5, vmax=8.0)
+                ax_sam_h.set_title(f"SAM [deg] ({hscnn_name})")
+                ax_sam_h.axis('off')
+                fig.colorbar(im_sam_h, ax=ax_sam_h, fraction=0.046, pad=0.04, shrink=0.8)
+
+            if mstpp_model is not None:
+                with torch.no_grad():
+                    preds_mstpp = mstpp_model(X_batch)
+
+                nse_mstpp = pixelwise_normalized_spectral_error(preds_mstpp, y_target)[0].cpu().numpy()
+                sam_mstpp = pixelwise_spectral_angle_mapper(preds_mstpp, y_target)[0].cpu().numpy()
+
+                ax_nse_m = axes[row_idx, 3]
+                im_nse_m = ax_nse_m.imshow(nse_mstpp, cmap='magma', vmin=0.0, vmax=1.0)
+                ax_nse_m.set_title(f"NSE ({mstpp_name})")
+                ax_nse_m.axis('off')
+                fig.colorbar(im_nse_m, ax=ax_nse_m, fraction=0.046, pad=0.04, shrink=0.8)
+
+                ax_sam_m = axes[row_idx, 4]
+                im_sam_m = ax_sam_m.imshow(sam_mstpp, cmap='magma', vmin=1.5, vmax=8.0)
+                ax_sam_m.set_title(f"SAM [deg] ({mstpp_name})")
+                ax_sam_m.axis('off')
+                fig.colorbar(im_sam_m, ax=ax_sam_m, fraction=0.046, pad=0.04, shrink=0.8)
+
+        plt.tight_layout(h_pad=1.0, w_pad=0.5, rect=[0, 0.03, 1, 0.95])
+        plt.show()
+        # break
+
+
+import torch
+import matplotlib.pyplot as plt
+
+device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+
+
+def show_flash_failure_maps():
+    for batch_idx, spectra in enumerate(test_loader):
+        spectra = spectra.to(device)
+        spectra_palettes = spectra.view(1, 16, 31)
+
+        fig, axes = plt.subplots(2, 5, figsize=(18, 7))
+        fig.suptitle(f"Error Maps (Simulated FLASH FAILURE) - Test Patch #{batch_idx + 1}", fontsize=16)
+
+        for row_idx, is_flash in enumerate([False, True]):
+            torch.manual_seed(42 + batch_idx)
+
+            if is_flash:
+                X_batch, y_target = renderer.render_batch(spectra_palettes)
+
+                X_batch[:, 3:, :, :] = 0.0
+                row_label = "Flash ZEROED!"
+            else:
+                X_batch, y_target = renderer.render_no_flash_batch(spectra_palettes)
+                row_label = "No Flash Model"
+
             input_rgb = X_batch[0, :3].permute(1, 2, 0).cpu().numpy()
 
-        with torch.no_grad():
-            preds = model(X_batch)
+            ax_rgb = axes[row_idx, 0]
+            ax_rgb.imshow(input_rgb)
+            ax_rgb.set_title(f"Input RGB\n({row_label})", fontsize=11)
+            ax_rgb.axis('off')
 
-        nse_map = pixelwise_normalized_spectral_error(preds, y_target)[0].cpu().numpy()
-        sam_map = pixelwise_spectral_angle_mapper(preds, y_target)[0].cpu().numpy()
+            hscnn_name, hscnn_model = None, None
+            mstpp_name, mstpp_model = None, None
 
-        ax_rgb = axes[idx, 0]
-        ax_nse = axes[idx, 1]
-        ax_sam = axes[idx, 2]
+            for name, config in models_dict.items():
+                if config["is_flash"] == is_flash:
+                    if "mstpp" in name:
+                        mstpp_name, mstpp_model = name, config["model"]
+                    else:
+                        hscnn_name, hscnn_model = name, config["model"]
 
-        ax_rgb.imshow(input_rgb)
-        ax_rgb.set_title(f"Input RGB ({name})")
-        ax_rgb.axis('off')
+            if hscnn_model is not None:
+                with torch.no_grad():
+                    preds_hscnn = hscnn_model(X_batch)
 
-        im_nse = ax_nse.imshow(nse_map, cmap='magma', vmin=0.0, vmax=1.0)
-        ax_nse.set_title(f"NSE Error Map ({name})")
-        ax_nse.axis('off')
-        fig.colorbar(im_nse, ax=ax_nse, fraction=0.046, pad=0.04)
+                nse_hscnn = pixelwise_normalized_spectral_error(preds_hscnn, y_target)[0].cpu().numpy()
+                sam_hscnn = pixelwise_spectral_angle_mapper(preds_hscnn, y_target)[0].cpu().numpy()
 
-        im_sam = ax_sam.imshow(sam_map, cmap='magma', vmin=1.5, vmax=8.0)
-        ax_sam.set_title(f"SAM Error Map [deg] ({name})")
-        ax_sam.axis('off')
-        fig.colorbar(im_sam, ax=ax_sam, fraction=0.046, pad=0.04)
+                ax_nse_h = axes[row_idx, 1]
+                im_nse_h = ax_nse_h.imshow(nse_hscnn, cmap='magma', vmin=0.0, vmax=1.0)
+                ax_nse_h.set_title(f"NSE ({hscnn_name})", fontsize=10)
+                ax_nse_h.axis('off')
+                fig.colorbar(im_nse_h, ax=ax_nse_h, fraction=0.046, pad=0.04, shrink=0.8)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show()
+                ax_sam_h = axes[row_idx, 2]
+                im_sam_h = ax_sam_h.imshow(sam_hscnn, cmap='magma', vmin=1.5, vmax=8.0)
+                ax_sam_h.set_title(f"SAM [deg] ({hscnn_name})", fontsize=10)
+                ax_sam_h.axis('off')
+                fig.colorbar(im_sam_h, ax=ax_sam_h, fraction=0.046, pad=0.04, shrink=0.8)
 
-    # break
+            if mstpp_model is not None:
+                with torch.no_grad():
+                    preds_mstpp = mstpp_model(X_batch)
+
+                nse_mstpp = pixelwise_normalized_spectral_error(preds_mstpp, y_target)[0].cpu().numpy()
+                sam_mstpp = pixelwise_spectral_angle_mapper(preds_mstpp, y_target)[0].cpu().numpy()
+
+                ax_nse_m = axes[row_idx, 3]
+                im_nse_m = ax_nse_m.imshow(nse_mstpp, cmap='magma', vmin=0.0, vmax=1.0)
+                ax_nse_m.set_title(f"NSE ({mstpp_name})", fontsize=10)
+                ax_nse_m.axis('off')
+                fig.colorbar(im_nse_m, ax=ax_nse_m, fraction=0.046, pad=0.04, shrink=0.8)
+
+                ax_sam_m = axes[row_idx, 4]
+                im_sam_m = ax_sam_m.imshow(sam_mstpp, cmap='magma', vmin=1.5, vmax=8.0)
+                ax_sam_m.set_title(f"SAM [deg] ({mstpp_name})", fontsize=10)
+                ax_sam_m.axis('off')
+                fig.colorbar(im_sam_m, ax=ax_sam_m, fraction=0.046, pad=0.04, shrink=0.8)
+
+        plt.tight_layout(h_pad=1.0, w_pad=0.5, rect=[0, 0.03, 1, 0.95])
+        plt.show()
+
+        # break  # Оставляем один патч для быстрой проверки
+
+
+# show_flash_failure_maps()
+# show_error_maps()
+
+show_error_maps_v2()
+
+def show_spectra_grid_4x4():
+    wavelengths = np.arange(400, 710, 10)
+
+    for batch_idx, spectra in enumerate(test_loader):
+        spectra = spectra.to(device)
+        spectra_palettes = spectra.view(1, 16, 31)
+
+        patch_size = 32
+        center_pixels = []
+        for row in range(4):
+            for col in range(4):
+                cy = row * patch_size + patch_size // 2
+                cx = col * patch_size + patch_size // 2
+                center_pixels.append((cy, cx))
+
+        predictions = {coord: {} for coord in center_pixels}
+        ground_truths = {}
+
+        for name, config in models_dict.items():
+            model = config["model"]
+            is_flash = config["is_flash"]
+
+            torch.manual_seed(42 + batch_idx)
+
+            if is_flash:
+                X_batch, y_target = renderer.render_batch(spectra_palettes)
+            else:
+                X_batch, y_target = renderer.render_no_flash_batch(spectra_palettes)
+
+            with torch.no_grad():
+                preds = model(X_batch)
+
+            for (y, x) in center_pixels:
+                predictions[(y, x)][name] = preds[0, :, y, x].cpu().numpy()
+                if (y, x) not in ground_truths:
+                    ground_truths[(y, x)] = y_target[0, :, y, x].cpu().numpy()
+
+        fig, axes = plt.subplots(4, 4, figsize=(20, 16))
+        fig.suptitle(f"Спектры для 16 патчей (Палитра #{batch_idx + 1})", fontsize=20, y=1.02)
+
+        colors = {
+            "mstpp_v1": "blue",
+            "mstpp_v1_with_flash": "cyan",
+            "hscnn_v1": "red",
+            "hscnn_v1_with_flash": "orange"
+        }
+
+        for idx, ((y, x), ax) in enumerate(zip(center_pixels, axes.flatten())):
+            ax.plot(wavelengths, ground_truths[(y, x)], color='black', linewidth=3, linestyle='--',
+                    label='Ground Truth')
+
+            for name in names_of_experiments:
+                ax.plot(wavelengths, predictions[(y, x)][name], color=colors[name], linewidth=2, alpha=0.8, label=name)
+
+            ax.set_title(f"Патч {idx + 1} (y={y}, x={x})", fontsize=12)
+            ax.set_xlabel("Длина волны (нм)", fontsize=10)
+            ax.set_ylabel("Отражение", fontsize=10)
+            ax.grid(True, linestyle=':', alpha=0.7)
+
+            if idx == 0:
+                ax.legend(loc='best', fontsize=10)
+
+        plt.tight_layout()
+        plt.show()
+
+        #break
+
+
+# show_spectra_grid_4x4()
